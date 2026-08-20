@@ -5,8 +5,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from langgraph.graph import END, StateGraph
-
 from multi_agent_research_lab.agents import (
     AnalystAgent,
     CriticAgent,
@@ -19,9 +17,17 @@ from multi_agent_research_lab.observability.tracing import trace_span
 
 logger = logging.getLogger(__name__)
 
+try:
+    from langgraph.graph import END, StateGraph
+
+    HAS_LANGGRAPH = True
+except ImportError:
+    HAS_LANGGRAPH = False
+    END = "__end__"
+
 
 class MultiAgentWorkflow:
-    """Builds and runs the multi-agent graph with LangGraph."""
+    """Builds and runs the multi-agent graph with LangGraph (with resilient fallback)."""
 
     def __init__(
         self,
@@ -36,10 +42,13 @@ class MultiAgentWorkflow:
         self.analyst = analyst or AnalystAgent()
         self.writer = writer or WriterAgent()
         self.critic = critic or CriticAgent()
-        self._graph: Any = self.build()
+        self._graph: Any = self.build() if HAS_LANGGRAPH else None
 
     def build(self) -> Any:
         """Create and compile the LangGraph workflow graph."""
+        if not HAS_LANGGRAPH:
+            return None
+
         builder: StateGraph[Any, Any, Any, Any] = StateGraph(ResearchState)
 
         # 1. Define nodes
@@ -103,13 +112,18 @@ class MultiAgentWorkflow:
         """Execute the graph and return the updated ResearchState."""
         with trace_span("multi_agent_workflow", attributes={"query": state.request.query}) as span:
             try:
-                output = self._graph.invoke(state)
-                if isinstance(output, dict):
-                    final_state = ResearchState.model_validate(output)
-                elif isinstance(output, ResearchState):
-                    final_state = output
+                if self._graph is not None:
+                    output = self._graph.invoke(state)
+                    if isinstance(output, dict):
+                        final_state = ResearchState.model_validate(output)
+                    elif isinstance(output, ResearchState):
+                        final_state = output
+                    else:
+                        final_state = state
                 else:
-                    final_state = state
+                    # Resilient fallback state loop if langgraph is not installed
+                    final_state = self._run_fallback_loop(state)
+
                 span["status"] = "success"
                 return final_state
             except Exception as exc:
@@ -118,3 +132,21 @@ class MultiAgentWorkflow:
                 span["status"] = "error"
                 span["error"] = str(exc)
                 return state
+
+    def _run_fallback_loop(self, state: ResearchState) -> ResearchState:
+        """Sequential state machine fallback in pure Python."""
+        agents = {
+            "researcher": self.researcher,
+            "analyst": self.analyst,
+            "writer": self.writer,
+            "critic": self.critic,
+        }
+        while True:
+            with trace_span("node_supervisor"):
+                state = self.supervisor.run(state)
+            last_route = state.route_history[-1] if state.route_history else "done"
+            if last_route not in agents or last_route == "done":
+                break
+            with trace_span(f"node_{last_route}"):
+                state = agents[last_route].run(state)
+        return state
